@@ -29,6 +29,15 @@ def main():
     game = game_module.Game(game)
 
     cfg = escher.Config()
+    # cfg.value_net = [256, 256]
+    # cfg.value_batch_size = 2048
+    # cfg.value_batch_steps = 5000
+    # cfg.regret_net = [256, 256]
+    # cfg.regret_batch_size = 2048
+    # cfg.regret_batch_steps = 5000
+    # cfg.avg_policy_net = [256, 256]
+    # cfg.avg_policy_batch_size = 2048
+    # cfg.avg_policy_batch_steps = 10000
     agent = escher.Agent(game, cfg)
 
     train_cfg = escher.TrainConfig()
@@ -36,6 +45,8 @@ def main():
     train_cfg.device_name = "cpu"
     train_cfg.game = game
     train_cfg.test_agent = agent_module.Random()
+    # train_cfg.test_every = 5
+    train_cfg.nashconv = True
     train_cfg.setup()
     logging.info("run_dir \"%s\"", train_cfg.run_dir)
 

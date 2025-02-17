@@ -18,10 +18,10 @@ class Config:
         self.memory_capacity = int(2.5e5)
 
         self.value_traversals = 1024
-        self.value_exploration = 0.2
-        self.value_net = [128]
+        self.value_exploration = 1
+        self.value_net = [128, 128]
         self.value_batch_size = 256
-        self.value_batch_steps = 1024
+        self.value_batch_steps = 1024*64
         self.value_learning_rate = 1e-3
 
         self.regret_traversals = 1024
@@ -42,12 +42,13 @@ class Agent:
         self.t = 0
 
         state = game.new_initial_state()
-        history_dim = _player_history(0, state.history()).shape[0]
+        self._history_dim = _player_history(0, state.history()).shape[0]
         obs_dim = state.information_state_tensor().shape[0]
         action_dim = game.num_distinct_actions()
 
         self.value_buffer = ReservoirBuffer(cfg.memory_capacity)
-        self.value_net = MLP(history_dim, cfg.value_net, action_dim)
+        self.value_net = MLP(self._history_dim, cfg.value_net, 1)
+        self.value_dict = {}
 
         self.regret_buffers = [ReservoirBuffer(cfg.memory_capacity) for _ in range(game.num_players())]
         self.regret_nets = [MLP(obs_dim, cfg.regret_net, action_dim) for _ in range(game.num_players())]
@@ -108,10 +109,10 @@ def _train_avg_policy(cfg, agent):
 
 
 def _gather_regret_data(game, agent, player):
+    added_states = {}
     for _ in range(agent.cfg.regret_traversals):
         state = game.new_initial_state()
         agent.num_touched += 1
-        my_sample_reach = 1
         while not state.is_terminal():
             # Get policy.
             current_player = state.current_player()
@@ -129,15 +130,11 @@ def _gather_regret_data(game, agent, player):
 
             # Add data to buffer.
             if current_player == player:
-                p_history = _player_history(current_player, state.history())
-                regret = _get_regret(agent, p_history, policy)
-
-                # Encourage learning leaf regrets.
-                regret *= min(1./my_sample_reach, 100)
-                my_sample_reach *= sample_policy[action]
-
-                sr = StateRegret(state=obs, regret=regret, mask=mask, t=agent.t)
-                agent.regret_buffers[player].add(sr)
+                if not (str(obs) in added_states):
+                    regret = _get_regret(agent, player, state, policy)
+                    sr = StateRegret(state=obs, regret=regret, mask=mask, t=agent.t)
+                    agent.regret_buffers[player].add(sr)
+                    # added_states[str(obs)] = True
             else:
                 behaviour = Behaviour(state=obs, policy=policy, t=agent.t)
                 agent.avg_policy_buffer.add(behaviour)
@@ -211,6 +208,7 @@ def _gather_value_data(game, agent, player):
             returns = state.returns()
 
             # Add transition.
+            history = state.history()
             tn = Transition(history=history, importance=importance, action=action, returns=returns)
             transitions.append(tn)
 
@@ -228,6 +226,20 @@ def _gather_value_data(game, agent, player):
 def _train_value(cfg, agent, player):
     _gather_value_data(cfg.game, agent, player)
 
+    agent.value_dict = {}
+    for i in range(len(agent.value_buffer)):
+        sav = agent.value_buffer[i]
+
+        # key = str(sav.state) + str(sav.action)
+        key = str(sav.state)
+        if not (key in agent.value_dict):
+            agent.value_dict[key] = []
+
+        agent.value_dict[key].append(sav.value)
+
+    for k, v in agent.value_dict.items():
+        agent.value_dict[k] = np.mean(v)
+
     num_epoch = 8
     epoch_steps = int(np.ceil(agent.cfg.value_batch_steps / num_epoch))
     dataloader_train = torch.utils.data.DataLoader(agent.value_buffer, batch_size=agent.cfg.value_batch_size, shuffle=True)
@@ -242,7 +254,11 @@ def _train_value(cfg, agent, player):
         for _ in range(epoch_steps):
             batch = next(iter(dataloader_train))
     
-            loss = _get_value_loss(agent, batch)
+            # loss = _get_value_loss(agent, batch)
+            x = batch.state.to(torch.float32)
+            value = agent.value_net(x)
+            loss = torch.pow(value - batch.value, 2)
+            loss = torch.mean(loss)
     
             optimizer.zero_grad()
             loss.backward()
@@ -251,7 +267,26 @@ def _train_value(cfg, agent, player):
             metrics = util.update_metric(metrics, "value/train/loss", loss)
     
         for k, v in metrics.items():
-            cfg.summary_writer.add_scalar(k, v.compute(), agent.value_t)
+            vv = v.compute()
+            cfg.summary_writer.add_scalar(k, vv, agent.value_t)
+            logging.info("%d %d %s", agent.t, agent.value_t, vv.item())
+
+    key_to_ts = {}
+    for i in range(len(agent.value_buffer)):
+        sav = agent.value_buffer[i]
+
+        key = str(sav.state)
+        key_to_ts[key] = sav.state
+
+    for k, v in agent.value_dict.items():
+        ts = key_to_ts[k]
+
+        with torch.no_grad():
+            x = torch.from_numpy(ts).to(torch.float32)
+            value = agent.value_net(x)
+        val = value.item()
+
+        logging.info("%s %s %s", v, val, ts)
 
 
 def _avg_policy_loss(agent, batch):
@@ -313,17 +348,82 @@ def _match_regret(regret_net, obs, mask_np):
     return policy
 
 
-def _get_regret(agent, history, policy_np):
-    device = agent.value_net.device()
-    with torch.no_grad():
-        x = torch.from_numpy(history).to(torch.float32).to(device)
-        policy = torch.from_numpy(policy_np).to(device)
+def _get_regret(agent, player, state, policy_np):
+    # # Get history for each action.
+    # mask = state.legal_actions_mask()
+    # history = np.zeros([np.sum(mask), agent._history_dim], dtype=float)
+    # legal_actions = {}
+    # for a, m in enumerate(mask):
+    #     if m == 1:
+    #         child = state.child(a)
+    #         i = len(legal_actions)
+    #         history[i] = _player_history(player, child.history())
+    #         legal_actions[a] = i
 
-        children_values = agent.value_net(x)
+    # # Use value_net to compute values.
+    # device = agent.value_net.device()
+    # with torch.no_grad():
+    #     x = torch.from_numpy(history).to(torch.float32).to(device)
+    #     legal_values = agent.value_net(x)
+    #     legal_values = legal_values.cpu().numpy()
 
-        value = torch.sum(policy * children_values)
-        regret = children_values - value
-    return regret.cpu().numpy()
+    # Compute overall value of state.
+    mask = state.legal_actions_mask()
+    children_values = np.zeros(mask.shape, dtype=float)
+    for a, m in enumerate(mask):
+        if m == 1:
+            child = state.child(a)
+
+            children_values[a] = _value_exact(player, agent, child)
+            good = children_values[a]
+
+            if child.is_terminal():
+                children_values[a] = child.returns()[player]
+            else:
+                history = _player_history(player, child.history())
+                # key = str(_player_history(player, state.history())) + str(a)
+                key = str(history)
+                if not (key in agent.value_dict):
+                    logging.info("%s", agent.value_dict)
+                    raise ValueError(key)
+                children_values[a] = agent.value_dict[key]
+
+            if child.is_terminal():
+                children_values[a] = child.returns()[player]
+            else:
+                history = _player_history(player, child.history())
+                device = agent.value_net.device()
+                with torch.no_grad():
+                    x = torch.from_numpy(history).to(torch.float32).to(device)
+                    v = agent.value_net(x)
+                children_values[a] = v.item()
+                # children_values[a] = legal_values[legal_actions[a]]
+            # logging.info("%s good %f nn %f player %d \"%s\" action %d", np.abs(good-children_values[a]), good, children_values[a], player, state._state, a)
+
+    value = np.sum(policy_np * children_values)
+    regret = children_values - value
+    return regret
+
+
+def _value_exact(player, agent, state):
+    if state.is_terminal():
+        return state.returns()[player]
+
+    # Get children values recursively.
+    mask = state.legal_actions_mask()
+    children_values = np.zeros(mask.shape, dtype=float)
+    for a, m in enumerate(mask):
+        if m == 1:
+            child = state.child(a)
+            children_values[a] = _value_exact(player, agent, child)
+
+    # Get policy.
+    current_player = state.current_player()
+    obs = state.information_state_tensor()
+    policy = _match_regret(agent.regret_nets[current_player], obs, mask)
+
+    value = np.sum(policy * children_values)
+    return value
 
 
 def _get_value_loss(agent, batch):
@@ -332,11 +432,7 @@ def _get_value_loss(agent, batch):
     x = batch.state.to(torch.float32).to(device)
     y_value = batch.value.to(device)
 
-    action_values = agent.value_net(x)
-
-    # Select values for each action.
-    batch_size = action_values.shape[0]
-    value = action_values[torch.arange(batch_size), batch.action]
+    value = agent.value_net(x)
 
     loss = torch.pow(value - y_value, 2)
     return torch.mean(loss)
