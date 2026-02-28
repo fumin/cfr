@@ -6,7 +6,6 @@ import pyspiel
 
 import agent as agent_module
 import game as game_module
-import escher
 
 
 def main():
@@ -28,10 +27,13 @@ def main():
     # game = pyspiel.load_game("dark_chess")
     game = game_module.Game(game)
 
-    cfg = escher.Config()
-    agent = escher.Agent(game, cfg)
+    import deepcfr
+    import escher
+    agent_mod = deepcfr
+    cfg = agent_mod.Config()
+    agent = agent_mod.Agent(game, cfg)
 
-    train_cfg = escher.TrainConfig()
+    train_cfg = agent_mod.TrainConfig()
     train_cfg.run_dir = args.run_dir
     train_cfg.device_name = "cpu"
     train_cfg.game = game
@@ -39,7 +41,7 @@ def main():
     train_cfg.setup()
     logging.info("run_dir \"%s\"", train_cfg.run_dir)
 
-    escher.train(train_cfg, agent)
+    agent_mod.train(train_cfg, agent)
 
 
 if __name__ == "__main__":

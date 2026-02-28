@@ -16,46 +16,24 @@ MLP = open_spiel.python.pytorch.deep_cfr.MLP
 SpielReservoirBuffer = open_spiel.python.pytorch.deep_cfr.ReservoirBuffer
 
 
-Config = collections.namedtuple("Config", [
-    "embedding_size",
-    "memory_capacity",
+class Config:
+    def __init__(self):
+        self.embedding_size = 64
+        self.memory_capacity = 1e6
 
-    "value_traversals",
-    "value_batch_size",
-    "value_batch_steps",
-    "value_learning_rate",
+        self.value_traversals = -1
+        self.value_batch_size = -1
+        self.value_batch_steps = -1
+        self.value_learning_rate = 1e-3
 
-    "regret_traversals",
-    "regret_batch_size",
-    "regret_batch_steps",
-    "regret_learning_rate",
+        self.regret_traversals = 1024
+        self.regret_batch_size = 256
+        self.regret_batch_steps = 375
+        self.regret_learning_rate = 1e-3
 
-    "avg_policy_batch_size",
-    "avg_policy_batch_steps",
-    "avg_policy_learning_rate",
-    ])
-
-
-def new_config():
-    cfg = Config(
-            embedding_size=64,
-            memory_capacity=1e6,
-
-            value_traversals=-1,
-            value_batch_size=-1,
-            value_batch_steps=-1,
-            value_learning_rate=1e-3,
-
-            regret_traversals=1024,
-            regret_batch_size=256,
-            regret_batch_steps=375,
-            regret_learning_rate=1e-3,
-
-            avg_policy_batch_size=256,
-            avg_policy_batch_steps=2500,
-            avg_policy_learning_rate=1e-3,
-            )
-    return cfg
+        self.avg_policy_batch_size = 256
+        self.avg_policy_batch_steps = 2500
+        self.avg_policy_learning_rate = 1e-3
 
 
 class Agent:
