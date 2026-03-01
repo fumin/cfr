@@ -5,7 +5,6 @@ import logging
 import pyspiel
 
 import agent as agent_module
-import game as game_module
 
 
 def main():
@@ -25,11 +24,10 @@ def main():
     # game = pyspiel.load_game("phantom_ttt")
     # game = pyspiel.load_game("dark_hex(board_size=5)")
     # game = pyspiel.load_game("dark_chess")
-    game = game_module.Game(game)
 
     import deepcfr
     import escher
-    agent_mod = deepcfr
+    agent_mod = escher
     cfg = agent_mod.Config()
     agent = agent_mod.Agent(game, cfg)
 
