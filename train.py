@@ -29,7 +29,7 @@ def main():
 
     import deepcfr
     import escher
-    agent_mod = deepcfr
+    agent_mod = escher
     cfg = agent_mod.Config()
     agent = agent_mod.Agent(game, cfg)
 

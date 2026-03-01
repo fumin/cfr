@@ -1,5 +1,6 @@
 import collections
 import logging
+import os
 
 import open_spiel
 from open_spiel.python.algorithms import exploitability as _
@@ -13,12 +14,12 @@ import util
 
 class Config:
     def __init__(self):
-        self.embedding_size = 64
-        self.memory_capacity = 1e6
+        # Default parameters for kuhn poker, which should result in an exploitability (nashconv) of less than 0.03 in roughly 100 iterations.
+        self.memory_capacity = int(2.5e5)
 
         self.value_traversals = 1024
         self.value_exploration = 1
-        self.value_net = [64]
+        self.value_net = [128]
         self.value_batch_size = 256
         self.value_batch_steps = 1024
         self.value_learning_rate = 1e-3
@@ -38,24 +39,21 @@ class Config:
 class Agent:
     def __init__(self, game, cfg):
         self.cfg = cfg
-        self.t = 1
+        self.t = 0
 
         state = game.new_initial_state()
-        history_dim = state.history().shape[0]
+        history_dim = _player_history(0, state.history()).shape[0]
         obs_dim = state.information_state_tensor().shape[0]
         action_dim = game.num_distinct_actions()
 
-        self._num_actions = action_dim
-
-        self.avg_policy_buffer = ReservoirBuffer(cfg.memory_capacity)
-        self.avg_policy_net = MLP(obs_dim, cfg.avg_policy_net, action_dim)
+        self.value_buffer = ReservoirBuffer(cfg.memory_capacity)
+        self.value_net = MLP(history_dim, cfg.value_net, action_dim)
 
         self.regret_buffers = [ReservoirBuffer(cfg.memory_capacity) for _ in range(game.num_players())]
         self.regret_nets = [MLP(obs_dim, cfg.regret_net, action_dim) for _ in range(game.num_players())]
 
-        self.value_buffers = [ReservoirBuffer(cfg.memory_capacity) for _ in range(game.num_players())]
-        self.value_nets = [MLP(history_dim, cfg.value_net, 1) for _ in range(game.num_players())]
-        self.value_maps = [{} for _ in range(game.num_players())]
+        self.avg_policy_buffer = ReservoirBuffer(cfg.memory_capacity)
+        self.avg_policy_net = MLP(obs_dim, cfg.avg_policy_net, action_dim)
 
         self.num_touched = 0
         self.avg_policy_t = 0
@@ -76,12 +74,18 @@ class Agent:
 
         return probs.cpu().numpy()
 
+    def get_action(self, state):
+        obs = state.information_state_tensor()
+        mask = state.legal_actions_mask()
+        policy = self.action_probabilities(obs, mask)
+        action = np.random.choice(range(len(policy)), p=policy)
+        return action
+
 
 def _train_avg_policy(cfg, agent):
     num_epoch = 8
     epoch_steps = int(np.ceil(agent.cfg.avg_policy_batch_steps / num_epoch))
-    dataloader_train = torch.utils.data.DataLoader(
-            agent.avg_policy_buffer, batch_size=agent.cfg.avg_policy_batch_size, shuffle=True)
+    dataloader_train = torch.utils.data.DataLoader(agent.avg_policy_buffer, batch_size=agent.cfg.avg_policy_batch_size, shuffle=True)
     optimizer = torch.optim.Adam(agent.avg_policy_net.parameters(), lr=agent.cfg.avg_policy_learning_rate)
 
     for _ in range(num_epoch):
@@ -92,7 +96,7 @@ def _train_avg_policy(cfg, agent):
         for _ in range(epoch_steps):
             batch = next(iter(dataloader_train))
 
-            loss = _get_avg_policy_loss(agent, batch)
+            loss = _avg_policy_loss(agent, batch)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -106,30 +110,41 @@ def _train_avg_policy(cfg, agent):
 def _gather_regret_data(game, agent, player):
     for _ in range(agent.cfg.regret_traversals):
         state = game.new_initial_state()
+        agent.num_touched += 1
+        my_sample_reach = 1
         while not state.is_terminal():
             # Get policy.
             current_player = state.current_player()
+            regret_net = agent.regret_nets[current_player]
             obs = state.information_state_tensor()
             mask = state.legal_actions_mask()
-            policy = _match_regret(agent, current_player, obs, mask)
+            policy = _match_regret(regret_net, obs, mask)
+
+            # Get action.
+            if current_player == player:
+                sample_policy = mask / np.sum(mask)
+            else:
+                sample_policy = policy
+            action = np.random.choice(range(len(sample_policy)), p=sample_policy)
 
             # Add data to buffer.
             if current_player == player:
-                regret = _get_regret(agent, state, policy)
-                # regret = _get_regret_exact(agent, state, policy)
+                p_history = _player_history(current_player, state.history())
+                regret = _get_regret(agent, p_history, policy)
+
+                # Encourage learning leaf regrets.
+                regret *= min(1./my_sample_reach, 100)
+                my_sample_reach *= sample_policy[action]
+
                 sr = StateRegret(state=obs, regret=regret, mask=mask, t=agent.t)
                 agent.regret_buffers[player].add(sr)
             else:
                 behaviour = Behaviour(state=obs, policy=policy, t=agent.t)
                 agent.avg_policy_buffer.add(behaviour)
 
-            # Update state with policy.
-            if current_player == player:
-                sample_policy = mask / np.sum(mask)
-            else:
-                sample_policy = policy
-            action = np.random.choice(range(len(sample_policy)), p=sample_policy)
+            # Update state.
             state = state.child(action)
+            agent.num_touched += 1
 
 
 def _train_regret(cfg, agent):
@@ -148,10 +163,11 @@ def _train_regret(cfg, agent):
             agent.regret_t += 1
             metrics = {}
 
+            regret_net.train()
             for _ in range(epoch_steps):
                 batch = next(iter(dataloader_train))
 
-                loss = _get_regret_loss(agent, player, batch)
+                loss = _regret_loss(agent, player, batch)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -164,8 +180,7 @@ def _train_regret(cfg, agent):
 
 
 def _gather_value_data(game, agent, player):
-    value_buffer = agent.value_buffers[player]
-    value_buffer.clear()
+    agent.value_buffer.clear()
     for _ in range(agent.cfg.value_traversals):
         state = game.new_initial_state()
         agent.num_touched += 1
@@ -180,8 +195,8 @@ def _gather_value_data(game, agent, player):
             policy = _match_regret(regret_net, obs, mask)
 
             # Sample action.
-            # epsilon = np.clip(agent.cfg.value_exploration / np.log(1+agent.t), a_min=0.01, a_max=1)
-            epsilon = agent.cfg.value_exploration
+            epsilon = np.clip(agent.cfg.value_exploration / np.log(1+agent.t), a_min=0.01, a_max=1)
+            # epsilon = agent.cfg.value_exploration
             if np.random.uniform(0, 1) < epsilon:
                 sample_policy = mask / np.sum(mask)
                 action = np.random.choice(range(len(sample_policy)), p=sample_policy)
@@ -204,79 +219,42 @@ def _gather_value_data(game, agent, player):
             tn = transitions[i]
 
             value += tn.returns
-            value_buffer.add(StateActionValue(state=tn.history, action=tn.action, value=value[player]))
+            p_history = _player_history(player, tn.history)
+            agent.value_buffer.add(StateActionValue(state=p_history, action=tn.action, value=value[player]))
 
             value *= tn.importance
 
 
-def _gather_value_data_exact(game, agent, player):
-    value_buffer = agent.value_buffers[player]
-    value_buffer.clear()
-    def callback(state, value):
-        value_buffer.add(StateActionValue(state=state.history(), action=-1, value=value))
-        agent.num_touched += 1
-
-    # Kuhn poker has 3 chance nodes.
-    # A population of 60 seems to be sufficient to sample all of them.
-    for _ in range(60):
-        state = game.new_initial_state()
-        _value_exact(agent, player, state, callback)
-
-
 def _train_value(cfg, agent, player):
-    _gather_value_data_exact(cfg.game, agent, player)
-    # _gather_value_data(cfg.game, agent, player)
-
-    # value_map = agent.value_maps[player]
-    # logging.info("%d player %d map %d", agent.t, player, len(value_map))
-    # value_map.clear()
-    # for sav in agent.value_buffers[player]:
-    #     k = str(sav.state)
-    #     value_map[k] = sav.value
-
-    # dataset = {}
-    # dataset["x"] = np.zeros([len(value_map), agent.value_buffers[player][0].state.shape[0]], dtype=float)
-    # dataset["y"] = np.zeros([len(value_map)], dtype=float)
-    # kss = {}
-    # for sav in agent.value_buffers[player]:
-    #     k = str(sav.state)
-    #     if k not in kss:
-    #         kss[k] = 1
-    #         dataset["x"][len(kss)-1, :] = sav.state
-    #         dataset["y"][len(kss)-1] = sav.value
-    # fpath = "data_{}_{}.pth".format(agent.t, player)
-    # torch.save(dataset, fpath)
-
-    # return
+    _gather_value_data(cfg.game, agent, player)
 
     num_epoch = 8
     epoch_steps = int(np.ceil(agent.cfg.value_batch_steps / num_epoch))
-    dataloader_train = torch.utils.data.DataLoader(agent.value_buffers[player], batch_size=agent.cfg.value_batch_size, shuffle=True)
-    value_net = agent.value_nets[player]
-    value_net.reset_parameters()
-    optimizer = torch.optim.Adam(value_net.parameters(), lr=agent.cfg.value_learning_rate)
-
+    dataloader_train = torch.utils.data.DataLoader(agent.value_buffer, batch_size=agent.cfg.value_batch_size, shuffle=True)
+    agent.value_net.reset_parameters()
+    optimizer = torch.optim.Adam(agent.value_net.parameters(), lr=agent.cfg.value_learning_rate)
+    
     for _ in range(num_epoch):
         agent.value_t += 1
         metrics = {}
-
-        agent.value_nets[player].train()
+    
+        agent.value_net.train()
         for _ in range(epoch_steps):
             batch = next(iter(dataloader_train))
-
-            loss = _get_value_loss(agent, player, batch)
-
+    
+            loss = _get_value_loss(agent, batch)
+    
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
+    
             metrics = util.update_metric(metrics, "value/train/loss", loss)
-
+    
         for k, v in metrics.items():
             cfg.summary_writer.add_scalar(k, v.compute(), agent.value_t)
 
 
-def _get_avg_policy_loss(agent, batch):
+def _avg_policy_loss(agent, batch):
     device = agent.avg_policy_net.device()
     x = batch.state.to(torch.float32).to(device)
     y_policy = batch.policy.to(device)
@@ -292,7 +270,7 @@ def _get_avg_policy_loss(agent, batch):
     return torch.mean(loss)
 
 
-def _get_regret_loss(agent, player, batch):
+def _regret_loss(agent, player, batch):
     device = agent.regret_nets[player].device()
 
     x = batch.state.to(torch.float32).to(device)
@@ -312,25 +290,12 @@ def _get_regret_loss(agent, player, batch):
     return loss
 
 
-def _get_value_loss(agent, player, batch):
-    device = agent.value_nets[player].device()
-
-    x = batch.state.to(torch.float32).to(device)
-    y_value = batch.value.to(device)
-
-    value = agent.value_nets[player](x)
-    value = torch.squeeze(value, dim=[1])
-
-    loss = torch.pow(value - y_value, 2)
-    return torch.mean(loss)
-
-
-def _match_regret(agent, player, obs, mask_np):
-    device = agent.regret_nets[player].device()
+def _match_regret(regret_net, obs, mask_np):
+    device = regret_net.device()
     with torch.no_grad():
         x = torch.from_numpy(obs).to(torch.float32).to(device)
-        regrets = agent.regret_nets[player](x)
-        raw_regrets = regrets.cpu().numpy()
+        regrets = regret_net(x)
+    raw_regrets = regrets.cpu().numpy()
 
     regrets = np.clip(raw_regrets, a_min=0, a_max=None)
     regrets = regrets * mask_np
@@ -339,7 +304,7 @@ def _match_regret(agent, player, obs, mask_np):
         return regrets / summed
 
     # Just use the best regret.
-    max_id, max_regret = 0, raw_regrets[0]
+    max_id, max_regret = -1, np.finfo(np.float32).min
     for i, m in enumerate(mask_np):
         if m == 1 and raw_regrets[i] > max_regret:
             max_id, max_regret = i, raw_regrets[i]
@@ -348,90 +313,87 @@ def _match_regret(agent, player, obs, mask_np):
     return policy
 
 
-def _get_regret(agent, state, policy):
-    player = state.current_player()
-    device = agent.value_nets[player].device()
+def _get_regret(agent, history, policy_np):
+    device = agent.value_net.device()
+    with torch.no_grad():
+        x = torch.from_numpy(history).to(torch.float32).to(device)
+        policy = torch.from_numpy(policy_np).to(device)
 
-    mask = state.legal_actions_mask()
-    children_values = np.zeros(mask.shape, dtype=float)
-    for a, m in enumerate(mask):
-        if m == 1:
-            child = state.child(a)
+        children_values = agent.value_net(x)
 
-            # value_map = agent.value_maps[player]
-            # k = str(child.history())
-            # if k not in value_map:
-            #     raise Exception("%d %s".format(len(value_map), k))
-            # v = value_map[k]
-            # v_ok = _value_exact(agent, player, child, None)
-            # if v != v_ok:
-            #     raise Exception("{} != {}".format(v, v_ok))
-            # children_values[a] = v
-            # continue
-
-            with torch.no_grad():
-                x = torch.from_numpy(child.history()).to(torch.float32).to(device)
-                children_values[a] = agent.value_nets[player](x)
-
-    value = np.sum(policy * children_values)
-    regret = children_values - value
-    return regret
+        value = torch.sum(policy * children_values)
+        regret = children_values - value
+    return regret.cpu().numpy()
 
 
-def _get_regret_exact(agent, state, policy):
-    player = state.current_player()
+def _get_value_loss(agent, batch):
+    device = agent.value_net.device()
 
-    # Get value of children.
-    mask = state.legal_actions_mask()
-    children_values = np.zeros(mask.shape, dtype=float)
-    for a, m in enumerate(mask):
-        if m == 1:
-            child = state.child(a)
-            children_values[a] = _value_exact(agent, player, child, None)
+    x = batch.state.to(torch.float32).to(device)
+    y_value = batch.value.to(device)
 
-    value = np.sum(policy * children_values)
-    regret = children_values - value
-    return regret
+    action_values = agent.value_net(x)
 
+    # Select values for each action.
+    batch_size = action_values.shape[0]
+    value = action_values[torch.arange(batch_size), batch.action]
 
-def _value_exact(agent, player, state, callback):
-    if state.is_terminal():
-        if callback:
-            callback(state, state.returns()[player])
-        return state.returns()[player]
-
-    # Get children values recursively.
-    mask = state.legal_actions_mask()
-    children_values = np.zeros(mask.shape, dtype=float)
-    for a, m in enumerate(mask):
-        if m == 1:
-            child = state.child(a)
-            children_values[a] = _value_exact(agent, player, child, callback)
-
-    # Get policy.
-    current_player = state.current_player()
-    obs = state.information_state_tensor()
-    policy = _match_regret(agent, current_player, obs, mask)
-
-    value = np.sum(policy * children_values)
-
-    if callback:
-        callback(state, value)
-    return value
+    loss = torch.pow(value - y_value, 2)
+    return torch.mean(loss)
 
 
-def _calc_nashconv(game, agent):
-    def action_probabilities(spiel_state):
-        state = game.from_spiel(spiel_state)
-        obs = state.information_state_tensor()
-        mask = state.legal_actions_mask()
-        probs = agent.action_probabilities(obs, mask)
-        return {a: probs[a] for a in spiel_state.legal_actions()}
+def load_checkpoint(agent, checkpoint_dir):
+    torch.serialization.add_safe_globals([Behaviour, StateRegret])
 
-    policy = open_spiel.python.policy.tabular_policy_from_callable(game._game, action_probabilities)
-    conv = open_spiel.python.algorithms.exploitability.nash_conv(game._game, policy)
-    logging.info("iteration %d nashconv %f", agent.t, conv)
-    return conv
+    cp, cp_path = util.load_checkpoint(checkpoint_dir)
+    if not cp:
+        logging.info("no checkpoint")
+        return
+
+    agent.t = cp["t"]
+    agent.avg_policy_net.load_state_dict(cp["avg_policy_net"])
+    for p, _ in enumerate(agent.regret_nets):
+        agent.regret_nets[p].load_state_dict(cp["regret_net_{}".format(p)])
+    agent.value_net.load_state_dict(cp["value_net"])
+
+    agent.num_touched = cp["num_touched"]
+    agent.avg_policy_t = cp["avg_policy_t"]
+    agent.regret_t = cp["regret_t"]
+    agent.value_t = cp["value_t"]
+
+    agent.avg_policy_buffer.load_state_dict(cp["avg_policy_buffer"])
+    capacity = agent.avg_policy_buffer._buf._reservoir_buffer_capacity
+    agent.avg_policy_buffer._buf._data = agent.avg_policy_buffer._buf._data[:capacity]
+    logging.info("loaded avg_policy_buffer %d", len(agent.avg_policy_buffer))
+    for p in range(len(agent.regret_buffers)):
+        agent.regret_buffers[p].load_state_dict(cp["regret_buffer_{}".format(p)])
+        agent.regret_buffers[p]._buf._data = agent.regret_buffers[p]._buf._data[:capacity]
+        logging.info("loaded regret_buffer[%d] %d", p, len(agent.regret_buffers[p]))
+
+    logging.info("loaded checkpoint %s", cp_path)
+
+
+def _save_checkpoint(checkpoint_dir, agent):
+    cp = {}
+    cp["t"] = agent.t
+    cp["avg_policy_net"] = agent.avg_policy_net.state_dict()
+    for p, _ in enumerate(agent.regret_nets):
+        cp["regret_net_{}".format(p)] = agent.regret_nets[p].state_dict()
+    cp["value_net"] = agent.value_net.state_dict()
+
+    cp["num_touched"] = agent.num_touched
+    cp["avg_policy_t"] = agent.avg_policy_t
+    cp["regret_t"] = agent.regret_t
+    cp["value_t"] = agent.value_t
+
+    cp["avg_policy_buffer"] = agent.avg_policy_buffer.state_dict()
+    for p in range(len(agent.regret_buffers)):
+        cp["regret_buffer_{}".format(p)] = agent.regret_buffers[p].state_dict()
+
+    cp_path = util.get_checkpoint_path(checkpoint_dir, agent.t)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save(cp, cp_path, _use_new_zipfile_serialization=False)
+    util.delete_old_checkpoints(checkpoint_dir)
 
 
 class TrainConfig:
@@ -439,7 +401,10 @@ class TrainConfig:
         self.run_dir = ""
         self.device_name = ""
         self.game = None
+
+        self.test_every = 20
         self.test_agent = None
+        self.nashconv = False
 
         # Derived fields.
         self.summary_writer = None
@@ -451,16 +416,77 @@ class TrainConfig:
 
 
 def train(cfg, agent):
+    checkpoint_dir = os.path.join(cfg.run_dir, "checkpoint")
+    load_checkpoint(agent, checkpoint_dir)
+
+    agent.avg_policy_net.to(cfg.device)
+    for net in agent.regret_nets:
+        net.to(cfg.device)
+    agent.value_net.to(cfg.device)
+
     for _ in range(999999):
-        _train_regret(cfg, agent)
         agent.t += 1
+        _train_regret(cfg, agent)
 
-        if agent.t % 20 == 0:
+        if agent.t % cfg.test_every == 0 or agent.t == 1:
             _train_avg_policy(cfg, agent)
-            _calc_nashconv(cfg.game, agent)
+
+            _test_against(cfg, agent)
+            _calc_nashconv(cfg, agent)
+
+            _save_checkpoint(checkpoint_dir, agent)
+            cfg.summary_writer.flush()
 
 
-Transition = collections.namedtuple("Transition", ["player", "observation", "importance", "action", "reward"])
+def _test_against(cfg, agent):
+    num_trials = 1000
+
+    score = 0.0
+    for i in range(num_trials):
+        # Prepare game participants.
+        agents = [cfg.test_agent for i in range(cfg.game.num_players())]
+        agent_idx = np.random.randint(len(agents))
+        agents[agent_idx] = agent
+        values = np.zeros([len(agents)], dtype=float)
+
+        # Play game.
+        state = cfg.game.new_initial_state()
+        while not state.is_terminal():
+            player = state.current_player()
+            act = agents[player].get_action(state)
+
+            state = state.child(act)
+            values += state.returns()
+        values += state.returns()
+
+        # Add score.
+        if values[agent_idx] > 0:
+            score += 1
+    score /= num_trials
+
+    cfg.summary_writer.add_scalar("score", score, agent.num_touched)
+    logging.info("%d states %d score %f", agent.t, agent.num_touched, score)
+
+
+def _calc_nashconv(cfg, agent):
+    if not cfg.nashconv:
+        return
+
+    def action_probabilities(spiel_state):
+        state = cfg.game.from_spiel(spiel_state)
+        obs = state.information_state_tensor()
+        mask = state.legal_actions_mask()
+        probs = agent.action_probabilities(obs, mask)
+        return {a: probs[a] for a in spiel_state.legal_actions()}
+
+    policy = open_spiel.python.policy.tabular_policy_from_callable(cfg.game._game, action_probabilities)
+    conv = open_spiel.python.algorithms.exploitability.nash_conv(cfg.game._game, policy)
+
+    cfg.summary_writer.add_scalar("nashconv", conv, agent.t)
+    logging.info("iteration %d nashconv %f", agent.t, conv)
+
+
+Transition = collections.namedtuple("Transition", ["history", "importance", "action", "returns"])
 StateActionValue = collections.namedtuple(
         "StateActionValue", ["state", "action", "value"])
 StateRegret = collections.namedtuple(
@@ -469,7 +495,11 @@ Behaviour = collections.namedtuple(
         "Behaviour", ["state", "policy", "t"])
 
 
-class ReservoirBuffer(object):
+def _player_history(player, history):
+    return np.concatenate([[player], history])
+
+
+class ReservoirBuffer:
     def __init__(self, capacity):
         self._buf = open_spiel.python.pytorch.deep_cfr.ReservoirBuffer(capacity)
 
@@ -484,6 +514,16 @@ class ReservoirBuffer(object):
 
     def __getitem__(self, idx):
         return self._buf._data[idx]
+
+    def state_dict(self):
+        d = {}
+        d["data"] = self._buf._data
+        d["add_calls"] = self._buf._add_calls
+        return d
+
+    def load_state_dict(self, d):
+        self._buf._data = d["data"]
+        self._buf._add_calls = d["add_calls"]
 
 
 class MLP(torch.nn.Module):
